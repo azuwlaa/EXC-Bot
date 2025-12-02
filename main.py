@@ -13,20 +13,16 @@ import pandas as pd
 
 
 # -------------------- EXC-bot CONFIG --------------------
-BOT_TOKEN = "PUT-YOUR-BOT-TOKEN-HERE"
+BOT_TOKEN = ""
 
 # Main group where staff are
-GROUP_ID = -1001437300434
+GROUP_ID = -1003463796946
 
 # Log channel where bot sends logs
-LOG_CHANNEL_ID = -1003449720539
+LOG_CHANNEL_ID = -1003395196772
 
 # Admin Telegram user IDs
-BOT_ADMINS = {
-    260161408,
-    744795573,
-    624102836
-}
+BOT_ADMINS = [2119444261, 624102836]  # replace with actual admin IDs
 
 # Local sqlite file
 DB_FILE = "exc_bot.db"
