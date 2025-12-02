@@ -1,19 +1,8 @@
-#!/usr/bin/env python3
-"""
-EXC-Bot: Attendance tracking bot
-Shift: 19:45 -> 23:00
-Overtime: after 23:00
-Staff commands: /clockin, /clockout, /sick, /off
-Admin commands: /add, /rm, /staff, /check, /status, /reset, /reset_clock, /undone, /backup, /report <month>
-Logs: LOG_CHANNEL_ID
-Auto backup daily at 00:05
-"""
-
 import io, sqlite3, re, calendar
 from datetime import datetime, time
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import pandas as pd
 
 # ---------------- CONFIG ----------------
@@ -24,7 +13,7 @@ BOT_ADMINS = [2119444261, 624102836]
 DB_FILE = "exc_bot.db"
 SHIFT_START = time(hour=19, minute=45)
 SHIFT_END = time(hour=23, minute=0)
-AUTO_BACKUP_TIME = time(hour=0, minute=5)
+AUTO_BACKUP_TIME = time(hour=0, minute=5)  # daily backup at 00:05 server time
 
 # ---------------- DATABASE ----------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -114,7 +103,8 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not registered as staff.")
         return
     cur.execute("SELECT clock_in FROM attendance WHERE user_id=? AND date=?",(uid,today))
-    if cur.fetchone()[0] is not None:
+    row = cur.fetchone()
+    if row and row[0]:
         await update.message.reply_text("❌ You already clocked in.")
         return
     late = compute_late(now_time)
@@ -275,13 +265,15 @@ async def daily_backup(context: ContextTypes.DEFAULT_TYPE):
 # ---------------- MAIN ----------------
 def main():
     auto_absent()
-    app=ApplicationBuilder().token(BOT_TOKEN).build()
-    # Staff
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Staff handlers
     app.add_handler(CommandHandler("clockin", cmd_clockin))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
     app.add_handler(CommandHandler("sick", cmd_sick))
     app.add_handler(CommandHandler("off", cmd_off))
-    # Admin
+
+    # Admin handlers
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("rm", cmd_rm))
     app.add_handler(CommandHandler("staff", cmd_staff))
@@ -292,9 +284,11 @@ def main():
     app.add_handler(CommandHandler("undone", cmd_undone))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("report", cmd_report))
-    # Job queue
-    job_queue=app.job_queue
-    job_queue.run_daily(daily_backup,time=AUTO_BACKUP_TIME)
+
+    # Job queue for daily backup
+    job_queue = app.job_queue
+    job_queue.run_daily(daily_backup, time=AUTO_BACKUP_TIME)
+
     print("✅ EXC-Bot running...")
     app.run_polling()
 
