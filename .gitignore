@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite database
+frc_bot.db
+
+# Excel files
+*.xlsx
+
+# Environment variables / token files
+.env
