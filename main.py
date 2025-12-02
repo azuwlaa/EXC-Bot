@@ -2,8 +2,7 @@ import io, sqlite3, re, calendar
 from datetime import datetime, time as dt_time
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
-from telegram.ext import Application, JobQueue
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
 import pandas as pd
 
 # ---------------- CONFIG ----------------
@@ -243,13 +242,7 @@ async def daily_backup(context: ContextTypes.DEFAULT_TYPE):
 # ---------------- MAIN ----------------
 def main():
     auto_absent()
-    
-    # Build app without automatically binding JobQueue
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # Explicitly get job_queue
-    job_queue = JobQueue()
-    job_queue.set_application(app)
 
     # Staff commands
     app.add_handler(CommandHandler("clockin", cmd_clockin))
@@ -268,12 +261,14 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("backup", cmd_backup))
 
-    # Schedule daily backup at AUTO_BACKUP_TIME
+    # Setup job queue manually to avoid weakref issue
+    job_queue = JobQueue()
+    job_queue.set_application(app)
     job_queue.run_daily(daily_backup, time=AUTO_BACKUP_TIME)
     job_queue.start()
 
     print("✅ EXC-Bot is running...")
     app.run_polling()
-    
+
 if __name__=="__main__":
     main()
