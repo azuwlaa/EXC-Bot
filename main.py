@@ -1,16 +1,6 @@
-#!/usr/bin/env python3
-"""
-EXC-Bot: Attendance tracking bot
-Shift: 19:45 -> 23:00
-Overtime: after 23:00
-Staff commands: /clockin, /clockout, /sick, /off
-Admin commands: /add, /rm, /staff, /check <id>, /status, /reset, /reset_clock, /report <month>, /backup
-Logs: LOG_CHANNEL_ID
-Auto backup daily at 00:05
-"""
 
 import io, sqlite3, re, calendar
-from datetime import datetime, time
+from datetime import datetime, time as dt_time
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -22,9 +12,9 @@ GROUP_ID = -1003463796946
 LOG_CHANNEL_ID = -1003395196772
 BOT_ADMINS = [2119444261, 624102836]
 DB_FILE = "exc_bot.db"
-SHIFT_START = time(hour=19, minute=45)
-SHIFT_END = time(hour=23, minute=0)
-AUTO_BACKUP_TIME = time(hour=0, minute=5)
+SHIFT_START = dt_time(hour=19, minute=45)
+SHIFT_END = dt_time(hour=23, minute=0)
+AUTO_BACKUP_TIME = dt_time(hour=0, minute=5)
 
 # ---------------- DATABASE ----------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -215,7 +205,6 @@ async def cmd_reset_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("DELETE FROM attendance WHERE status='Clocked In'"); conn.commit()
     await update.message.reply_text("✅ Clock-in data reset.")
 
-# /report <month>
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(context,update.effective_user.id): return
     if not context.args: await update.message.reply_text("Usage: /report <MonthName>"); return
@@ -224,7 +213,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if month_num==0: await update.message.reply_text("Invalid month"); return
     year=datetime.now().year
     month_prefix=f"{year}-{month_num:02d}"
-    df=pd.read_sql_query("SELECT * FROM attendance WHERE date LIKE ? ORDER BY date",(conn,month_prefix+'%'))
+    df=pd.read_sql_query(f"SELECT * FROM attendance WHERE date LIKE '{month_prefix}%'",conn)
     if df.empty: await update.message.reply_text("No data for this month."); return
     bio=io.BytesIO(); bio.name=f"Attendance_{month_name}_{year}.xlsx"
     df.to_excel(bio,index=False); bio.seek(0)
@@ -240,18 +229,29 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_document(LOG_CHANNEL_ID, document=InputFile(bio,bio.name))
     await update.message.reply_text("✅ Backup sent to log channel.")
 
+# ---------------- DAILY BACKUP ----------------
+async def daily_backup(context: ContextTypes.DEFAULT_TYPE):
+    df = pd.read_sql_query("SELECT * FROM attendance ORDER BY date", conn)
+    if df.empty: return
+    bio = io.BytesIO()
+    bio.name = f"EXC_Backup_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    df.to_excel(bio, index=False)
+    bio.seek(0)
+    await context.bot.send_document(LOG_CHANNEL_ID, document=InputFile(bio, bio.name))
+    print("✅ Daily backup sent to log channel")
+
 # ---------------- MAIN ----------------
 def main():
     auto_absent()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Staff
+    # Staff commands
     app.add_handler(CommandHandler("clockin", cmd_clockin))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
     app.add_handler(CommandHandler("sick", cmd_sick))
     app.add_handler(CommandHandler("off", cmd_off))
 
-    # Admin
+    # Admin commands
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("rm", cmd_rm))
     app.add_handler(CommandHandler("staff", cmd_staff))
@@ -262,10 +262,12 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("backup", cmd_backup))
 
-    async def schedule_jobs(app):
-        app.job_queue.run_daily(daily_backup, time=AUTO_BACKUP_TIME)
+    # Schedule daily backup at AUTO_BACKUP_TIME
+    job_queue = app.job_queue
+    job_queue.run_daily(daily_backup, time=AUTO_BACKUP_TIME)
 
-    app.run_polling(stop_signals=None, on_startup=[schedule_jobs])
+    print("✅ EXC-Bot is running...")
+    app.run_polling()
 
 if __name__=="__main__":
     main()
