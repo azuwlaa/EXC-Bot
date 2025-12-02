@@ -1,342 +1,289 @@
-import os
-import re
+#!/usr/bin/env python3
+"""
+EXC-Bot: Attendance tracking bot
+Shift: 19:45 -> 23:00
+Overtime: after 23:00
+Staff: /clockin, /clockout, /sick, /off
+Admins: all other commands
+Logs to LOG_CHANNEL_ID
+"""
+
 import io
 import sqlite3
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-
-from telegram import Update, InputFile, ParseMode
-from telegram.constants import ChatMemberStatus
+from datetime import datetime, time, timedelta
+from telegram import Update, InputFile
+from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
 import pandas as pd
 
-
-# -------------------- EXC-bot CONFIG --------------------
+# -------------------- CONFIG --------------------
 BOT_TOKEN = ""
-
-# Main group where staff are
 GROUP_ID = -1003463796946
-
-# Log channel where bot sends logs
 LOG_CHANNEL_ID = -1003395196772
-
-# Admin Telegram user IDs
-BOT_ADMINS = [2119444261, 624102836]  # replace with actual admin IDs
-
-# Local sqlite file
+BOT_ADMINS = [2119444261, 624102836]
 DB_FILE = "exc_bot.db"
-
-# Shift rules
-SHIFT_START = "19:45"
-SHIFT_END = "23:00"
-
-
-# -------------------- TIME HELPERS --------------------
-def gmt5_now() -> datetime:
-    return datetime.now(timezone.utc) + timedelta(hours=5)
-
-def today_str() -> str:
-    return gmt5_now().strftime("%Y-%m-%d")
-
-def hhmm_to_dt(hhmm: str, ref: Optional[datetime] = None) -> datetime:
-    ref_dt = ref or gmt5_now()
-    hh, mm = map(int, hhmm.split(":"))
-    return ref_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
-
-def escape_md(t: str) -> str:
-    if not t:
-        return ""
-    return re.sub(r'([_\*\[\]\(\)\~\>\#\+\-\=\|\{\}\.\!])', r'\\\1', t)
-
+SHIFT_START = time(hour=19, minute=45)
+SHIFT_END = time(hour=23, minute=0)
 
 # -------------------- DATABASE --------------------
-_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-_cur = _conn.cursor()
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cur = conn.cursor()
 
-def init_db():
-    _cur.execute("""
-        CREATE TABLE IF NOT EXISTS staff(
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT
-        )
-    """)
-    _cur.execute("""
-        CREATE TABLE IF NOT EXISTS attendance(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            full_name TEXT,
-            date TEXT,
-            clock_in TEXT,
-            clock_out TEXT,
-            status TEXT,
-            late_minutes INTEGER DEFAULT 0,
-            overtime_minutes INTEGER DEFAULT 0,
-            UNIQUE(user_id,date)
-        )
-    """)
-    _cur.execute("CREATE INDEX IF NOT EXISTS idx_att_user_date ON attendance(user_id,date)")
-    _conn.commit()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS staff(
+    user_id INTEGER PRIMARY KEY,
+    full_name TEXT
+)
+""")
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS attendance(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    full_name TEXT,
+    date TEXT,
+    clock_in TEXT,
+    clock_out TEXT,
+    late_minutes INTEGER DEFAULT 0,
+    overtime_minutes INTEGER DEFAULT 0,
+    worked_hours REAL DEFAULT 0,
+    status TEXT DEFAULT 'present',
+    UNIQUE(user_id,date)
+)
+""")
+conn.commit()
 
-# -------------------- LOGGING --------------------
-async def bot_log(bot, text: str):
+# -------------------- HELPERS --------------------
+def today_str():
+    return datetime.now().strftime("%Y-%m-%d")
+
+def escape_md(text: str):
+    import re
+    if not text:
+        return ""
+    return re.sub(r'([_\*\[\]\(\)\~\>\#\+\-\=\|\{\}\.\!])', r'\\\1', text)
+
+async def send_log(bot, msg: str):
     try:
-        await bot.send_message(LOG_CHANNEL_ID, text, parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(LOG_CHANNEL_ID, msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        print("LOG ERROR:", e)
+        print("Log error:", e)
 
-
-# -------------------- ADMIN CHECK --------------------
-async def is_group_admin(context, user_id):
+async def is_admin(context, user_id):
     try:
-        m = await context.bot.get_chat_member(GROUP_ID, user_id)
-        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+        admins = await context.bot.get_chat_administrators(GROUP_ID)
+        admin_ids = [a.user.id for a in admins]
+        return user_id in admin_ids or user_id in BOT_ADMINS
     except:
-        return False
+        return user_id in BOT_ADMINS
 
-async def admin_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_only(update, context):
     uid = update.effective_user.id
+    if not await is_admin(context, uid):
+        await update.message.reply_text("❌ You are not allowed to use this command.")
+        return False
+    return True
 
-    if uid in BOT_ADMINS:
-        return True
-    if await is_group_admin(context, uid):
-        return True
+def compute_late_minutes(clock_in_str):
+    now_dt = datetime.strptime(clock_in_str, "%H:%M").time()
+    late = max(0, int((datetime.combine(datetime.today(), now_dt) -
+                        datetime.combine(datetime.today(), SHIFT_START)).total_seconds() // 60))
+    return late
 
-    await update.message.reply_text("❌ You are not allowed to use this command.")
-    return False
+def compute_overtime(clock_out_str):
+    now_dt = datetime.strptime(clock_out_str, "%H:%M").time()
+    overtime = max(0, int((datetime.combine(datetime.today(), now_dt) -
+                           datetime.combine(datetime.today(), SHIFT_END)).total_seconds() // 60))
+    return overtime
 
+def compute_worked_hours(clock_in_str, clock_out_str):
+    if not clock_in_str or not clock_out_str:
+        return 0
+    t1 = datetime.strptime(clock_in_str, "%H:%M")
+    t2 = datetime.strptime(clock_out_str, "%H:%M")
+    worked = (t2 - t1).total_seconds() / 3600
+    return round(max(0, worked), 2)
 
-# -------------------- STAFF COMMANDS --------------------
-async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = msg.from_user
-    uid = user.id
-    name = user.full_name
-    today = today_str()
-    now = gmt5_now()
-    now_s = now.strftime("%H:%M")
-
-    # ensure staff
-    _cur.execute("SELECT user_id FROM staff WHERE user_id=?", (uid,))
-    if not _cur.fetchone():
-        await msg.reply_text("❌ You are not registered as staff.")
-        return
-
-    _cur.execute("SELECT clock_in FROM attendance WHERE user_id=? AND date=?", (uid, today))
-    rec = _cur.fetchone()
-    if rec and rec[0]:
-        await msg.reply_text("❌ You already clocked in.")
-        return
-
-    shift_start_dt = hhmm_to_dt(SHIFT_START, now)
-    late_m = max(0, int((now - shift_start_dt).total_seconds() // 60))
-
-    _cur.execute("""
-        INSERT INTO attendance (user_id, full_name, date, clock_in, status, late_minutes)
-        VALUES (?,?,?,?,?,?)
-        ON CONFLICT(user_id,date)
-        DO UPDATE SET clock_in=excluded.clock_in, status='Clocked In', late_minutes=excluded.late_minutes
-    """, (uid, name, today, now_s, "Clocked In", late_m))
-    _conn.commit()
-
-    text = f"✅ [{escape_md(name)}](tg://user?id={uid}) clocked in at `{now_s}` (Late: {late_m}m)"
-    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    await bot_log(context.bot, "🟢 " + text)
-
-
-async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = msg.from_user
-    uid = user.id
-    name = user.full_name
-    today = today_str()
-    now = gmt5_now()
-    now_s = now.strftime("%H:%M")
-
-    _cur.execute("SELECT clock_in, clock_out FROM attendance WHERE user_id=? AND date=?", (uid, today))
-    rec = _cur.fetchone()
-
-    if not rec or not rec[0]:
-        await msg.reply_text("❌ You haven't clocked in.")
-        return
-    if rec[1]:
-        await msg.reply_text("❌ You already clocked out.")
-        return
-
-    shift_end_dt = hhmm_to_dt(SHIFT_END, now)
-    overtime = max(0, int((now - shift_end_dt).total_seconds() // 60)) if now > shift_end_dt else 0
-
-    _cur.execute("""
-        UPDATE attendance
-        SET clock_out=?, status='Clocked Out', overtime_minutes=?
-        WHERE user_id=? AND date=?
-    """, (now_s, overtime, uid, today))
-    _conn.commit()
-
-    text = f"🔴 [{escape_md(name)}](tg://user?id={uid}) clocked out at `{now_s}` (OT: {overtime}m)"
-    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    await bot_log(context.bot, "🔴 " + text)
-
-
-async def cmd_sick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = msg.from_user
-    uid = user.id
-    name = user.full_name
-    today = today_str()
-
-    _cur.execute("""
-        INSERT INTO attendance (user_id, full_name, date, status)
-        VALUES (?,?,?,?)
-        ON CONFLICT(user_id,date)
-        DO UPDATE SET status='Sick', clock_in=NULL, clock_out=NULL, late_minutes=0, overtime_minutes=0
-    """, (uid, name, today, "Sick"))
-    _conn.commit()
-
-    text = f"🤒 Marked Sick for [{escape_md(name)}](tg://user?id={uid})"
-    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    await bot_log(context.bot, text)
-
-
-async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = msg.from_user
-    uid = user.id
-    name = user.full_name
-    today = today_str()
-
-    _cur.execute("""
-        INSERT INTO attendance (user_id, full_name, date, status)
-        VALUES (?,?,?,?)
-        ON CONFLICT(user_id,date)
-        DO UPDATE SET status='Off', clock_in=NULL, clock_out=NULL, late_minutes=0, overtime_minutes=0
-    """, (uid, name, today, "Off"))
-    _conn.commit()
-
-    text = f"📘 Marked Off for [{escape_md(name)}](tg://user?id={uid})"
-    await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    await bot_log(context.bot, text)
-
-
-# -------------------- ADMIN COMMANDS --------------------
 def auto_absent():
+    """Mark absent staff automatically if not clocked in today"""
     today = today_str()
-    _cur.execute("SELECT user_id, full_name FROM staff")
-    staff_rows = _cur.fetchall()
+    cur.execute("SELECT user_id, full_name FROM staff")
+    staff_rows = cur.fetchall()
     for uid, name in staff_rows:
-        _cur.execute("SELECT id FROM attendance WHERE user_id=? AND date=?", (uid, today))
-        if not _cur.fetchone():
-            _cur.execute("""
+        cur.execute("SELECT id FROM attendance WHERE user_id=? AND date=?", (uid, today))
+        if not cur.fetchone():
+            cur.execute("""
                 INSERT OR IGNORE INTO attendance(user_id, full_name, date, status)
                 VALUES (?, ?, ?, 'Absent')
             """, (uid, name, today))
-    _conn.commit()
+    conn.commit()
 
+# -------------------- STAFF COMMANDS --------------------
+async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = user.id
+    name = user.full_name
+    today = today_str()
+    now_time = datetime.now().strftime("%H:%M")
 
+    # Check if staff
+    cur.execute("SELECT user_id FROM staff WHERE user_id=?", (uid,))
+    if not cur.fetchone():
+        await update.message.reply_text("❌ You are not registered as staff.")
+        return
+
+    # Already clocked in
+    cur.execute("SELECT clock_in FROM attendance WHERE user_id=? AND date=?", (uid, today))
+    row = cur.fetchone()
+    if row and row[0]:
+        await update.message.reply_text("❌ You already clocked in.")
+        return
+
+    late_m = compute_late_minutes(now_time)
+    cur.execute("""
+        INSERT INTO attendance(user_id, full_name, date, clock_in, status, late_minutes)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(user_id,date)
+        DO UPDATE SET clock_in=excluded.clock_in, status='Clocked In', late_minutes=excluded.late_minutes
+    """, (uid, name, today, now_time, "Clocked In", late_m))
+    conn.commit()
+
+    text = f"🟢 [{escape_md(name)}](tg://user?id={uid}) clocked in at `{now_time}` (Late: {late_m}m)"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await send_log(context.bot, text)
+
+async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = user.id
+    name = user.full_name
+    today = today_str()
+    now_time = datetime.now().strftime("%H:%M")
+
+    cur.execute("SELECT clock_in, clock_out FROM attendance WHERE user_id=? AND date=?", (uid, today))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        await update.message.reply_text("❌ You haven't clocked in yet.")
+        return
+    if row[1]:
+        await update.message.reply_text("❌ You already clocked out.")
+        return
+
+    ot = compute_overtime(now_time)
+    worked = compute_worked_hours(row[0], now_time)
+    cur.execute("""
+        UPDATE attendance
+        SET clock_out=?, status='Clocked Out', overtime_minutes=?, worked_hours=?
+        WHERE user_id=? AND date=?
+    """, (now_time, ot, worked, uid, today))
+    conn.commit()
+
+    text = f"🔴 [{escape_md(name)}](tg://user?id={uid}) clocked out at `{now_time}` (OT: {ot}m, Worked: {worked}h)"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await send_log(context.bot, text)
+
+async def cmd_sick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = user.id
+    name = user.full_name
+    today = today_str()
+    cur.execute("""
+        INSERT INTO attendance(user_id, full_name, date, status)
+        VALUES (?,?,?,?)
+        ON CONFLICT(user_id,date)
+        DO UPDATE SET status='Sick', clock_in=NULL, clock_out=NULL, late_minutes=0, overtime_minutes=0, worked_hours=0
+    """, (uid, name, today, "Sick"))
+    conn.commit()
+    text = f"🤒 Marked Sick for [{escape_md(name)}](tg://user?id={uid})"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await send_log(context.bot, text)
+
+async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = user.id
+    name = user.full_name
+    today = today_str()
+    cur.execute("""
+        INSERT INTO attendance(user_id, full_name, date, status)
+        VALUES (?,?,?,?)
+        ON CONFLICT(user_id,date)
+        DO UPDATE SET status='Off', clock_in=NULL, clock_out=NULL, late_minutes=0, overtime_minutes=0, worked_hours=0
+    """, (uid, name, today, "Off"))
+    conn.commit()
+    text = f"📘 Marked Off for [{escape_md(name)}](tg://user?id={uid})"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await send_log(context.bot, text)
+
+# -------------------- ADMIN COMMANDS --------------------
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
     auto_absent()
     msg = update.message
-    now = gmt5_now()
+    now = datetime.now()
     month = now.strftime("%Y-%m")
-
     if msg.reply_to_message:
         uid = msg.reply_to_message.from_user.id
-    else:
-        if not context.args:
-            await msg.reply_text("Usage: reply or /check <id>")
-            return
+    elif context.args:
         uid = int(context.args[0])
+    else:
+        await msg.reply_text("Usage: reply or /check <user_id>")
+        return
 
-    _cur.execute("SELECT full_name FROM staff WHERE user_id=?", (uid,))
-    row = _cur.fetchone()
+    cur.execute("SELECT full_name FROM staff WHERE user_id=?", (uid,))
+    row = cur.fetchone()
     if not row:
         await msg.reply_text("Staff not found.")
         return
     name = row[0]
 
-    _cur.execute("""
-        SELECT date, clock_in, clock_out, status, late_minutes, overtime_minutes
+    cur.execute("""
+        SELECT date, clock_in, clock_out, status, late_minutes, overtime_minutes, worked_hours
         FROM attendance
         WHERE user_id=? AND date LIKE ?
         ORDER BY date
     """, (uid, f"{month}%"))
-    rows = _cur.fetchall()
+    rows = cur.fetchall()
     if not rows:
         await msg.reply_text("No records this month.")
         return
 
-    total_late = sum((r[4] or 0) for r in rows)
-    total_ot = sum((r[5] or 0) for r in rows)
-    total_hours = 0.0
+    total_late = sum(r[4] for r in rows)
+    total_ot = sum(r[5] for r in rows)
+    total_hours = sum(r[6] for r in rows)
     details = []
+    for d, cin, cout, st, late, ot, wh in rows:
+        details.append(f"• {d} — In:{cin or '-'} Out:{cout or '-'} {st} Late:{late}m OT:{ot}m Worked:{wh}h")
 
-    for d, cin, cout, st, late, ot in rows:
-        worked = 0
-        if cin and cout:
-            t1 = datetime.strptime(f"{d} {cin}", "%Y-%m-%d %H:%M")
-            t2 = datetime.strptime(f"{d} {cout}", "%Y-%m-%d %H:%M")
-            worked = round((t2 - t1).total_seconds() / 3600, 2)
-            total_hours += worked
-
-        details.append(
-            f"• {d} — In:{cin or '-'} Out:{cout or '-'} {st} Late:{late}m OT:{ot}m Worked:{worked}h"
-        )
-
-    text = (
-        f"*Summary for {escape_md(name)} — {now.strftime('%B %Y')}*\n"
-        f"• Total Late: {total_late} minutes\n"
-        f"• Total OT: {total_ot} minutes\n"
-        f"• Total Hours: {round(total_hours,2)}\n\n"
-        "*Daily:* \n" + "\n".join(details)
-    )
-
+    text = f"*Summary for {escape_md(name)} — {now.strftime('%B %Y')}*\n" \
+           f"• Total Late: {total_late} minutes\n" \
+           f"• Total OT: {total_ot} minutes\n" \
+           f"• Total Hours Worked: {round(total_hours,2)}\n\n" \
+           "*Daily Records:* \n" + "\n".join(details)
     await msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
-    df = pd.read_sql_query("""
-        SELECT user_id, full_name, date, clock_in, clock_out, status, late_minutes, overtime_minutes
-        FROM attendance
-        ORDER BY date
-    """, _conn)
-
+    auto_absent()
+    df = pd.read_sql_query("SELECT * FROM attendance ORDER BY date", conn)
     if df.empty:
         await update.message.reply_text("No data.")
         return
-
     bio = io.BytesIO()
-    fname = f"exc_report_{gmt5_now().strftime('%Y-%m')}.xlsx"
-    bio.name = fname
-
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as w:
-        df.to_excel(w, index=False, sheet_name="Attendance")
-
+    bio.name = f"EXC_Attendance_{datetime.now().strftime('%Y-%m')}.xlsx"
+    with pd.ExcelWriter(bio, engine='xlsxwriter') as w:
+        df.to_excel(w, index=False)
     bio.seek(0)
-    await update.message.reply_document(InputFile(bio, filename=fname))
-    await bot_log(context.bot, "📁 Report sent.")
-
+    await update.message.reply_document(InputFile(bio, filename=bio.name))
+    await send_log(context.bot, "📁 Attendance report sent.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
+    auto_absent()
     today = today_str()
-    _cur.execute("""
-        SELECT full_name, user_id, clock_in, clock_out, status
-        FROM attendance
-        WHERE date=?
-        ORDER BY full_name
-    """, (today,))
-    rows = _cur.fetchall()
-
+    cur.execute("SELECT full_name, user_id, clock_in, clock_out, status FROM attendance WHERE date=? ORDER BY full_name", (today,))
+    rows = cur.fetchall()
     if not rows:
         await update.message.reply_text("No attendance today.")
         return
-
     lines = []
     for name, uid, cin, cout, st in rows:
         if cin and cout:
@@ -345,134 +292,74 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• [{escape_md(name)}](tg://user?id={uid}) In:`{cin}`")
         else:
             lines.append(f"• [{escape_md(name)}](tg://user?id={uid}) — {st}")
-
-    await update.message.reply_text(
-        "*Today's attendance:*\n" + "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
+    await update.message.reply_text("*Today's attendance:*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
     await update.message.reply_document(InputFile(DB_FILE))
-    await bot_log(context.bot, "💾 Backup sent.")
-
+    await send_log(context.bot, "💾 Database backup sent.")
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
-    _cur.execute("DELETE FROM attendance")
-    _conn.commit()
-
-    await update.message.reply_text("Attendance cleared.")
-    await bot_log(context.bot, "⚠️ Admin cleared all attendance.")
-
+    cur.execute("DELETE FROM attendance")
+    conn.commit()
+    await update.message.reply_text("✅ All attendance cleared.")
+    await send_log(context.bot, "⚠️ Admin cleared all attendance.")
 
 async def cmd_reset_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
-    t = today_str()
-    _cur.execute("DELETE FROM attendance WHERE date=?", (t,))
-    _conn.commit()
-
-    await update.message.reply_text("Today's attendance cleared.")
-    await bot_log(context.bot, "♻️ Admin reset today's attendance.")
-
+    cur.execute("DELETE FROM attendance WHERE date=?", (today_str(),))
+    conn.commit()
+    await update.message.reply_text("✅ Today's attendance cleared.")
+    await send_log(context.bot, "♻️ Admin reset today's attendance.")
 
 async def cmd_undone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
-    msg = update.message
-
-    if msg.reply_to_message:
-        uid = msg.reply_to_message.from_user.id
-        date_s = context.args[0] if context.args else today_str()
-    else:
-        if len(context.args) < 1:
-            await msg.reply_text("Usage: /undone <user_id> <date>")
-            return
-        uid = int(context.args[0])
-        date_s = context.args[1] if len(context.args) > 1 else today_str()
-
-    try:
-        datetime.strptime(date_s, "%Y-%m-%d")
-    except:
-        await msg.reply_text("Invalid date format.")
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /undone <user_id>")
         return
+    uid = int(context.args[0])
+    cur.execute("UPDATE attendance SET clock_out=NULL, overtime_minutes=0, worked_hours=0, status='Clocked In' WHERE user_id=? AND date=?", (uid, today_str()))
+    conn.commit()
+    await update.message.reply_text("✅ Clock-out undone.")
+    await send_log(context.bot, f"↩️ Clock-out undone for {uid} today.")
 
-    _cur.execute("""
-        UPDATE attendance
-        SET clock_out=NULL, overtime_minutes=0, status='Clocked In'
-        WHERE user_id=? AND date=?
-    """, (uid, date_s))
-    _conn.commit()
-
-    await msg.reply_text("Clock-out undone.")
-    await bot_log(context.bot, f"↩️ Undone for {uid} on {date_s}")
-
-
-# ---------------- STAFF MANAGEMENT --------------------
+# -------------------- STAFF MANAGEMENT --------------------
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
-    msg = update.message
-
-    if msg.reply_to_message:
-        uid = msg.reply_to_message.from_user.id
-        name = " ".join(context.args) if context.args else msg.reply_to_message.from_user.full_name
-    else:
-        if len(context.args) < 2:
-            await msg.reply_text("Usage: /add <id> <Full Name> OR reply")
-            return
-        uid = int(context.args[0])
-        name = " ".join(context.args[1:])
-
-    _cur.execute("INSERT OR REPLACE INTO staff(user_id, full_name) VALUES (?,?)", (uid, name))
-    _conn.commit()
-
-    await msg.reply_text(f"Added staff: {name}")
-    await bot_log(context.bot, f"➕ Added staff {uid} ({escape_md(name)})")
-
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /add <id> <Full Name>")
+        return
+    uid = int(context.args[0])
+    name = " ".join(context.args[1:])
+    cur.execute("INSERT OR REPLACE INTO staff(user_id, full_name) VALUES (?,?)", (uid, name))
+    conn.commit()
+    await update.message.reply_text(f"✅ Added staff: {name}")
+    await send_log(context.bot, f"➕ Added staff {uid} ({escape_md(name)})")
 
 async def cmd_rm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
-    msg = update.message
-
-    if msg.reply_to_message:
-        uid = msg.reply_to_message.from_user.id
-    else:
-        if not context.args:
-            await msg.reply_text("Usage: /rm <id> OR reply")
-            return
-        uid = int(context.args[0])
-
-    _cur.execute("DELETE FROM staff WHERE user_id=?", (uid,))
-    _conn.commit()
-
-    await msg.reply_text("Removed staff.")
-    await bot_log(context.bot, f"➖ Removed staff {uid}")
-
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /rm <id>")
+        return
+    uid = int(context.args[0])
+    cur.execute("DELETE FROM staff WHERE user_id=?", (uid,))
+    conn.commit()
+    await update.message.reply_text(f"✅ Removed staff {uid}")
+    await send_log(context.bot, f"➖ Removed staff {uid}")
 
 async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
-
-    _cur.execute("SELECT user_id, full_name FROM staff ORDER BY full_name")
-    rows = _cur.fetchall()
+    cur.execute("SELECT user_id, full_name FROM staff ORDER BY full_name")
+    rows = cur.fetchall()
     if not rows:
-        await update.message.reply_text("No staff.")
+        await update.message.reply_text("No staff found.")
         return
-
-    lines = [f"• [{escape_md(n)}](tg://user?id={uid})" for uid, n in rows]
-    await update.message.reply_text("*Staff List:*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
+    text = "\n".join([f"• [{escape_md(n)}](tg://user?id={uid})" for uid, n in rows])
+    await update.message.reply_text("*Staff List:*\n" + text, parse_mode=ParseMode.MARKDOWN)
 
 # -------------------- MAIN --------------------
 def main():
-    print("EXC-bot running…")
-
-    init_db()
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Staff commands
@@ -482,10 +369,6 @@ def main():
     app.add_handler(CommandHandler("off", cmd_off))
 
     # Admin commands
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("rm", cmd_rm))
-    app.add_handler(CommandHandler("staff", cmd_staff))
-
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -493,9 +376,12 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("reset_clock", cmd_reset_clock))
     app.add_handler(CommandHandler("undone", cmd_undone))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("rm", cmd_rm))
+    app.add_handler(CommandHandler("staff", cmd_staff))
 
+    print("✅ EXC-Bot running...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
