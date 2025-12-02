@@ -284,6 +284,49 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(InputFile(bio, filename=fname))
     await bot_log(context.bot, "📁 Report sent.")
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update, context): return
+    today = today_str()
+    _cur.execute("""
+        SELECT full_name, user_id, clock_in, clock_out, status
+        FROM attendance
+        WHERE date=?
+        ORDER BY full_name
+    """, (today,))
+    rows = _cur.fetchall()
+    if not rows:
+        await update.message.reply_text("No attendance today.")
+        return
+    lines = []
+    for name, uid, cin, cout, st in rows:
+        if cin and cout:
+            lines.append(f"• [{escape_md(name)}](tg://user?id={uid}) In:`{cin}` Out:`{cout}`")
+        elif cin:
+            lines.append(f"• [{escape_md(name)}](tg://user?id={uid}) In:`{cin}`")
+        else:
+            lines.append(f"• [{escape_md(name)}](tg://user?id={uid}) — {st}")
+    await update.message.reply_text("*Today's attendance:*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update, context): return
+    await update.message.reply_document(InputFile(DB_FILE))
+    await bot_log(context.bot, "💾 Backup sent.")
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update, context): return
+    _cur.execute("DELETE FROM attendance")
+    _conn.commit()
+    await update.message.reply_text("Attendance cleared.")
+    await bot_log(context.bot, "⚠️ Admin cleared all attendance.")
+
+async def cmd_reset_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update, context): return
+    t = today_str()
+    _cur.execute("DELETE FROM attendance WHERE date=?", (t,))
+    _conn.commit()
+    await update.message.reply_text("Today's attendance cleared.")
+    await bot_log(context.bot, "♻️ Admin reset today's attendance.")
+
 async def cmd_undone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
     msg = update.message
@@ -309,21 +352,6 @@ async def cmd_undone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _conn.commit()
     await msg.reply_text(f"↩️ Clock-out undone for user {uid} on {date_s}.")
     await bot_log(context.bot, f"↩️ Admin undone clock-out for user {uid} on {date_s}")
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update, context): return
-    _cur.execute("DELETE FROM attendance")
-    _conn.commit()
-    await update.message.reply_text("Attendance cleared.")
-    await bot_log(context.bot, "⚠️ Admin cleared all attendance.")
-
-async def cmd_reset_clock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update, context): return
-    t = today_str()
-    _cur.execute("DELETE FROM attendance WHERE date=?", (t,))
-    _conn.commit()
-    await update.message.reply_text("Today's attendance cleared.")
-    await bot_log(context.bot, "♻️ Admin reset today's attendance.")
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update, context): return
